@@ -129,3 +129,15 @@ ul.plain { margin: 0; padding-left: 18px; display: flex; flex-direction: column;
   .two { grid-template-columns: 1fr; }
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+
+/* Sign-in screen (hosted site) */
+.authwrap { min-height: 100%; display: grid; place-items: center; padding-block: 40px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+.authcard { width: 100%; max-width: 400px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 28px; display: flex; flex-direction: column; gap: 14px; }
+.authcard .brand { padding-inline: 0; }
+.authcard h1 { font-size: 1.35rem; }
+.authcard button.ghost { align-self: center; }
+.authcard p.small button.ghost { padding: 0; font-size: inherit; }
+.autherr { border-left: 3px solid var(--bad); background: var(--bad-soft); color: var(--fg); padding: 10px 12px; border-radius: 4px; font-size: 0.86rem; }
+.account { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding-inline: 6px; min-width: 0; }
+.account span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account button.ghost { padding: 0; font-size: 0.82rem; }
