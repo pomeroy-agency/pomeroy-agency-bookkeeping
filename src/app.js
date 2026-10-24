@@ -17,7 +17,7 @@ const CONFIG = window.LEDGERLINE_CONFIG || {};
 const pref = { get(k) { try { return localStorage.getItem(k); } catch { return null; } }, set(k, v) { try { localStorage.setItem(k, v); } catch { } } };
 const Store = {
   mode: CONFIG.supabaseUrl ? 'cloud' : 'memory', db: null, ref: null, timer: null, status: 'Example data, not saved yet',
-  sb: null, user: null, authReady: false, versions: {}, saved: {}, removed: new Set(), queue: Promise.resolve(),
+  sb: null, user: null, authReady: false, versions: {}, saved: {}, roles: {}, removed: new Set(), queue: Promise.resolve(),
   async init() {
     if (this.mode === 'cloud') return this.initCloud();
     try {
@@ -55,8 +55,12 @@ const Store = {
     this.authReady = true; render();
   },
   async loadCloud() {
-    this.setStatus('Loading your books…', '');
+    this.setStatus('Loading your books\u2026', '');
+    const joined = await this.sb.rpc('accept_invites');
+    if (joined.data > 0) toast(`You now have access to ${joined.data} new ${joined.data === 1 ? 'company' : 'companies'}.`);
     const { data, error } = await this.sb.from('companies').select('id, data, version').order('created_at');
+    const mine = await this.sb.from('company_members').select('company_id, role').eq('user_id', this.user.id);
+    this.roles = Object.fromEntries((mine.data || []).map(r => [r.company_id, r.role]));
     if (error) { this.setStatus('Could not load your books: ' + error.message, 'warn'); render(); return; }
     this.versions = {}; this.saved = {}; this.removed.clear();
     if (data.length) {
@@ -86,7 +90,7 @@ const Store = {
       if (this.versions[id] == null) {
         const { data, error } = await this.sb.from('companies').insert({ id, name: c.name, data: c }).select('version').single();
         if (error) throw error;
-        this.versions[id] = data.version;
+        this.versions[id] = data.version; this.roles[id] = 'owner';
       } else {
         const { data, error } = await this.sb.from('companies').update({ name: c.name, data: c }).eq('id', id).eq('version', this.versions[id]).select('version');
         if (error) throw error;
@@ -108,7 +112,8 @@ const Store = {
       if (!this.user) return;
       try { await this.saveCloud(); this.setStatus('Saved to your account', 'ok'); }
       catch (e) {
-        if (e.stale) { toast('Your last change was not saved. These books were changed somewhere else, or you have view-only access. Showing the latest saved version.', true); await this.loadCloud(); }
+        if (e.stale && myRole() === 'viewer') { toast('You have view-only access to this company, so changes are not saved.', true); await this.loadCloud(); }
+        else if (e.stale) { toast('Your last change was not saved. These books were changed somewhere else, or you have view-only access. Showing the latest saved version.', true); await this.loadCloud(); }
         else this.setStatus('Could not save: ' + (e.message || 'error') + '. Your changes are still on this screen.', 'warn');
       }
       return;
@@ -127,9 +132,19 @@ const Store = {
   setStatus(text, kind) { this.status = text; this.kind = kind; const el = $('#savestate'); if (el) el.innerHTML = `<span class="dot ${kind}"></span><span>${esc(text)}</span>`; },
 };
 function loadSample() { const s = buildSampleCompany(); state = { companies: { [s.id]: s }, order: [s.id], activeId: s.id }; }
+/* Role in the active company. Companies not yet saved to the account are the creator's own. */
+function myRole(id = state.activeId) { return Store.mode === 'cloud' && Store.versions[id] != null ? (Store.roles[id] || 'viewer') : 'owner'; }
+const canEdit = () => myRole() !== 'viewer';
+const ROLES = { owner: 'Owner', accountant: 'Accountant', bookkeeper: 'Bookkeeper', viewer: 'View only' };
 function resetView() { Object.assign(ui, { route: 'overview', range: null, recon: null, ledgerAcct: null, docDraft: null, jeDraft: null, payFor: null, reverseFor: null, confirmDelete: false, modal: null }); }
 
-function commit(msg) { Store.save(); render(); if (msg) toast(msg); }
+function commit(msg) {
+  if (!canEdit()) {
+    const id = state.activeId; if (Store.saved[id]) state.companies[id] = JSON.parse(Store.saved[id]);
+    render(); return toast('You have view-only access to this company. Ask the owner for edit access.', true);
+  }
+  Store.save(); render(); if (msg) toast(msg);
+}
 function attempt(fn, okMsg) { try { fn(); commit(okMsg); } catch (e) { toast(e.message, true); } }
 let toastTimer;
 function toast(msg, err) {
@@ -166,7 +181,7 @@ function presets(c) {
 }
 
 /* ----- Shell ----- */
-const NAV = [['overview', 'Overview'], ['bank', 'Bank feed'], ['invoices', 'Invoices'], ['bills', 'Bills'], ['journal', 'Journal'], ['accounts', 'Chart of accounts'], ['reconcile', 'Reconcile'], ['reports', 'Reports'], ['settings', 'Settings'], ['about', 'About this prototype']];
+const NAV = [['overview', 'Overview'], ['bank', 'Bank feed'], ['invoices', 'Invoices'], ['bills', 'Bills'], ['journal', 'Journal'], ['accounts', 'Chart of accounts'], ['reconcile', 'Reconcile'], ['reports', 'Reports'], ['team', 'Team'], ['settings', 'Settings'], ['about', 'About this prototype']];
 
 function render() {
   if (Store.mode === 'cloud' && (!Store.authReady || !Store.user)) { $('#root').innerHTML = authView(); return; }
@@ -175,7 +190,7 @@ function render() {
   E.setCurrency(c.currency, c.country);
   if (!ui.bankAcct || !E.acct(c, ui.bankAcct)) ui.bankAcct = (bankAccts(c)[0] || {}).id;
   if (!ui.range) ui.range = fyRange(c);
-  const views = { overview, bank, invoices: () => docs('invoice'), bills: () => docs('bill'), journal, accounts, reconcile, reports, settings, about };
+  const views = { overview, bank, invoices: () => docs('invoice'), bills: () => docs('bill'), journal, accounts, reconcile, reports, settings, about, team };
   const focusId = document.activeElement?.id;
   $('#root').innerHTML = shell((views[ui.route] || overview)(c));
   if (focusId && document.getElementById(focusId)) document.getElementById(focusId).focus();
@@ -193,11 +208,11 @@ function shell(body) {
     <div class="field"><span>Company</span>
       <select id="company-switch" data-change="switch-company">${state.order.map(id => `<option value="${id}" ${id === state.activeId ? 'selected' : ''}>${esc(state.companies[id].name)}</option>`).join('')}<option value="__new">+ New company…</option></select>
     </div>
-    <nav aria-label="Sections">${NAV.map(([k, l]) => `<button data-act="go" data-v="${k}" ${ui.route === k ? 'aria-current="page"' : ''}><span>${l}</span>${counts[k] ? `<span class="badge">${counts[k]}</span>` : ''}</button>`).join('')}</nav>
+    <nav aria-label="Sections">${NAV.filter(([k]) => k !== 'team' || Store.mode === 'cloud').map(([k, l]) => `<button data-act="go" data-v="${k}" ${ui.route === k ? 'aria-current="page"' : ''}><span>${l}</span>${counts[k] ? `<span class="badge">${counts[k]}</span>` : ''}</button>`).join('')}</nav>
     <div class="savestate" id="savestate"><span class="dot ${Store.kind || ''}"></span><span>${esc(Store.status)}</span></div>
     ${Store.user ? `<div class="account"><span class="muted small" title="${esc(Store.user.email)}">${esc(Store.user.email)}</span><button class="ghost" data-act="sign-out">Sign out</button></div>` : ''}
   </aside>
-  <main><div class="wrap">${c && c.sample ? `<div class="banner"><span><strong>You are looking at example data.</strong> Riverside Coffee Roasters is fictional. Try anything here, then set up your own company.</span><button class="primary" data-act="new-company">Set up my company</button></div>` : ''}${body}</div></main>
+  <main><div class="wrap">${c && !canEdit() ? `<div class="banner"><span><strong>View only.</strong> You can look at these books but not change them.</span></div>` : ''}${c && c.sample ? `<div class="banner"><span><strong>You are looking at example data.</strong> Riverside Coffee Roasters is fictional. Try anything here, then set up your own company.</span><button class="primary" data-act="new-company">Set up my company</button></div>` : ''}${body}</div></main>
   </div>`;
 }
 
@@ -505,7 +520,7 @@ function settings(c) {
     <div class="cards">${[['Bank and card feeds', 'Daily transactions from banks and card issuers through an aggregator such as Plaid, MX or open banking APIs.'], ['Payment processors', 'Payouts, fees and refunds from Stripe, Square and PayPal, split into gross sales and fees.'], ['Payroll', 'Wages, withholdings and employer taxes posted as one summary entry per pay run.'], ['Tax agencies', `Prepared ${esc(j.tax)} and income tax figures handed to your accountant or e-filing service.`], ['Related companies', 'Intercompany entries between companies you own, with eliminations for consolidated reports.'], ['Your accountant', 'Invite an accountant to review, adjust and sign off on period close.']].map(([t, d]) => `<div class="conn"><div class="row" style="justify-content:space-between"><strong>${t}</strong><span class="pill warn">planned</span></div><p class="muted small">${d}</p></div>`).join('')}</div></section>
   <section class="panel"><h2>Backup</h2><p class="muted">Download a complete copy of every company as JSON, or restore from one.</p>
     <div class="row">${Downloads.ok ? '<button data-act="backup">Download backup</button>' : '<span class="muted small">Downloads are not available in this view.</span>'}<label class="btn" for="restore-file" style="display:inline-block">Restore from file</label><input type="file" id="restore-file" accept=".json,application/json" hidden></div></section>
-  <section class="panel"><h2>Delete company</h2>${ui.confirmDelete ? `<p>This permanently removes <strong>${esc(c.name)}</strong> and all of its records.</p><div class="row"><button class="danger" data-act="delete-yes">Delete ${esc(c.name)}</button><button class="ghost" data-act="delete-no">Keep it</button></div>` : `<div><button class="danger" data-act="delete-ask">Delete this company</button></div>`}</section>`;
+  ${myRole() !== 'owner' ? '' : `<section class="panel"><h2>Delete company</h2>${ui.confirmDelete ? `<p>This permanently removes <strong>${esc(c.name)}</strong> and all of its records.</p><div class="row"><button class="danger" data-act="delete-yes">Delete ${esc(c.name)}</button><button class="ghost" data-act="delete-no">Keep it</button></div>` : `<div><button class="danger" data-act="delete-ask">Delete this company</button></div>`}</section>`}`;
 }
 
 /* ----- About ----- */
@@ -549,6 +564,67 @@ function wizard() {
     <p class="muted small">Not seeing your country? This prototype covers six English-speaking jurisdictions to start.</p>
     <div class="row"><button class="primary" data-act="wiz-save">Create company</button><button class="ghost" data-act="wiz-cancel">Cancel</button></div>
   </div></div>`;
+}
+
+/* ----- Team (hosted site only) ----- */
+const Team = {
+  async load() {
+    const id = state.activeId;
+    ui.team = { id, loading: true };
+    render();
+    if (Store.versions[id] == null) { ui.team = { id, unsaved: true }; return render(); }
+    const people = await Store.sb.rpc('company_people', { cid: id });
+    const invites = myRole() === 'owner' ? await Store.sb.from('company_invites').select('email, role, created_at').eq('company_id', id).order('created_at') : { data: [] };
+    if (state.activeId !== id) return;
+    ui.team = { ...ui.team, id, loading: false, people: people.data || [], invites: invites.data || [], error: people.error?.message || invites.error?.message };
+    render();
+  },
+  async run(fn, msg) {
+    const { error } = await fn();
+    if (error) return toast(error.message, true);
+    toast(msg); this.load();
+  },
+  async invite() {
+    const email = $('#tm-email').value.trim().toLowerCase(), role = $('#tm-role').value;
+    if (!/^\S+@\S+\.\S+$/.test(email)) return toast('Enter a valid email address.', true);
+    if (email === (Store.user.email || '').toLowerCase()) return toast('That is your own email.', true);
+    if ((ui.team.people || []).some(p => p.email.toLowerCase() === email)) return toast('That person already has access.', true);
+    const { error } = await Store.sb.from('company_invites').insert({ company_id: state.activeId, email, role, invited_by: Store.user.id });
+    if (error) return toast(error.code === '23505' ? `${email} is already invited.` : error.message, true);
+    toast(`Invited ${email}.`);
+    await this.load(); ui.team.lastInvite = email; render();
+  },
+  async leave() {
+    const { error } = await Store.sb.from('company_members').delete().eq('company_id', state.activeId).eq('user_id', Store.user.id);
+    if (error) return toast(error.message, true);
+    toast('You left the company.'); await Store.loadCloud();
+  },
+};
+function team(c) {
+  const T = ui.team && ui.team.id === c.id ? ui.team : null;
+  const owner = myRole() === 'owner';
+  const head = header('Team', `Who can see and work on the books for ${esc(c.name)}. Your role: <strong>${ROLES[myRole()]}</strong>.`);
+  if (!T || T.loading) return head + '<section class="panel"><p class="muted">Loading…</p></section>';
+  if (T.unsaved) return head + '<section class="panel"><p>Make a change to this company first so it is saved to your account. Then you can invite people.</p></section>';
+  const roleOpts = sel => ['accountant', 'bookkeeper', 'viewer'].map(r => `<option value="${r}" ${r === sel ? 'selected' : ''}>${ROLES[r]}</option>`).join('');
+  return head + (T.error ? `<p class="autherr">${esc(T.error)}</p>` : '') + `
+  <section class="grid" style="gap:10px"><h2>People with access</h2>
+  <div class="tablewrap"><table><thead><tr><th>Email</th><th>Role</th><th>Added</th><th></th></tr></thead><tbody>
+  ${T.people.map(p => { const me = p.user_id === Store.user.id; return `<tr><td>${esc(p.email)}${me ? ' <span class="muted small">(you)</span>' : ''}</td>
+    <td>${owner && p.role !== 'owner' ? `<select id="tm-role-${p.user_id}" data-change="team-role" data-user="${p.user_id}" aria-label="Role for ${esc(p.email)}">${roleOpts(p.role)}</select>` : ROLES[p.role]}</td>
+    <td class="muted small">${new Date(p.added_at).toLocaleDateString()}</td>
+    <td>${owner && p.role !== 'owner' ? `<button class="ghost danger" data-act="team-remove" data-v="${p.user_id}">Remove</button>` : me && p.role !== 'owner' ? '<button class="ghost danger" data-act="team-leave">Leave company</button>' : ''}</td></tr>`; }).join('')}
+  </tbody></table></div></section>
+  ${owner ? `<section class="panel"><h2>Invite someone</h2>
+    <div class="form"><label class="field" style="grid-column:span 2"><span>Email</span><input type="email" id="tm-email" placeholder="accountant@firm.com" autocomplete="off"></label>
+    <label class="field"><span>Role</span><select id="tm-role">${roleOpts('accountant')}</select></label></div>
+    <ul class="plain small muted"><li><strong>Accountant</strong> and <strong>Bookkeeper</strong> can record, change and reconcile everything in these books.</li><li><strong>View only</strong> can open every page and report but cannot change anything.</li><li>Only you, the owner, can invite people, change roles or delete the company.</li></ul>
+    <div><button class="primary" data-act="team-invite">Send invite</button></div>
+    ${T.lastInvite ? `<p class="note">Ledgerline does not email invitations yet. Tell ${esc(T.lastInvite)} to create an account at <strong>${esc(location.origin)}</strong> using this email address. The company appears for them as soon as they sign in.</p>` : ''}
+  </section>
+  ${T.invites.length ? `<section class="grid" style="gap:10px"><h2>Waiting to join</h2><div class="tablewrap"><table><thead><tr><th>Email</th><th>Role</th><th>Invited</th><th></th></tr></thead><tbody>
+    ${T.invites.map(i => `<tr><td>${esc(i.email)}</td><td>${ROLES[i.role]}</td><td class="muted small">${new Date(i.created_at).toLocaleDateString()}</td><td><button class="ghost danger" data-act="team-cancel" data-v="${esc(i.email)}">Cancel invite</button></td></tr>`).join('')}
+  </tbody></table></div></section>` : ''}` : ''}`;
 }
 
 /* ----- Sign in (hosted site only) ----- */
@@ -614,7 +690,11 @@ document.addEventListener('click', e => {
     case 'auth-mode': ui.authMode = ui.authMode === 'signup' ? 'signin' : 'signup'; ui.authMsg = null; render(); break;
     case 'auth-magic': authRun(async email => { const { error } = await Store.sb.auth.signInWithOtp({ email, options: { emailRedirectTo: location.origin } }); if (error) throw error; return { text: `We sent a sign-in link to ${email}.` }; }); break;
     case 'sign-out': Store.queue.then(() => Store.sb.auth.signOut()); break;
-    case 'go': ui.route = v; ui.modal = null; render(); window.scrollTo(0, 0); break;
+    case 'go': ui.route = v; ui.modal = null; render(); window.scrollTo(0, 0); if (v === 'team') Team.load(); break;
+    case 'team-invite': Team.invite(); break;
+    case 'team-cancel': Team.run(() => Store.sb.from('company_invites').delete().eq('company_id', state.activeId).eq('email', v), 'Invite cancelled.'); break;
+    case 'team-remove': Team.run(() => Store.sb.from('company_members').delete().eq('company_id', state.activeId).eq('user_id', v), 'Access removed.'); break;
+    case 'team-leave': Team.leave(); break;
     case 'report': ui.route = 'reports'; ui.reportTab = v; render(); break;
     case 'new-company': openWizard(); break;
     case 'wiz-cancel': ui.modal = null; render(); break;
@@ -709,7 +789,7 @@ function rerenderKeep(t) { const id = t.id, pos = t.selectionStart; render(); co
 document.addEventListener('change', async e => {
   const t = e.target, c = co();
   switch (t.dataset.change) {
-    case 'switch-company': if (t.value === '__new') { t.value = state.activeId; openWizard(); } else { state.activeId = t.value; ui.range = null; ui.recon = null; ui.ledgerAcct = null; ui.docDraft = null; ui.jeDraft = null; Store.save(); render(); } return;
+    case 'switch-company': if (t.value === '__new') { t.value = state.activeId; openWizard(); } else { state.activeId = t.value; ui.team = null; if (ui.route === 'team') setTimeout(() => Team.load()); ui.range = null; ui.recon = null; ui.ledgerAcct = null; ui.docDraft = null; ui.jeDraft = null; Store.save(); render(); } return;
     case 'bank-pick': ui.bankAcct = t.value; render(); return;
     case 'rc-acct': ui.recon = { acct: t.value, end: ui.recon.end, bal: '', ticked: new Set() }; render(); return;
     case 'rc-end': ui.recon.end = t.value; render(); return;
@@ -717,6 +797,7 @@ document.addEventListener('change', async e => {
     case 'rg-to': ui.range = { ...ui.range, to: t.value }; render(); return;
     case 'rg-preset': if (t.value) { ui.range = presets(c)[t.value]; render(); } return;
     case 'gl-acct': ui.ledgerAcct = t.value || null; render(); return;
+    case 'team-role': Team.run(() => Store.sb.from('company_members').update({ role: t.value }).eq('company_id', state.activeId).eq('user_id', t.dataset.user), 'Role updated.'); return;
   }
   if (t.dataset.set) {
     const k = t.dataset.set;
