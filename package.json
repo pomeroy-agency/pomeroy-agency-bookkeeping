@@ -5,6 +5,8 @@
   "description": "Bookkeeping prototype: double-entry ledger, invoices, bills, bank import, reconciliation and financial statements.",
   "scripts": {
     "build": "bash scripts/build.sh",
-    "test": "node test/engine.test.js"
+    "test": "node test/engine.test.js",
+    "test:db": "bash supabase/tests/rls_test.sh",
+    "test:browser": "SUPABASE_URL=https://demo.supabase.co SUPABASE_ANON_KEY=test bash scripts/build.sh && node test/cloud.browser.js"
   }
 }

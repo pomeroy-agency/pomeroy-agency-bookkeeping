@@ -9,10 +9,17 @@ let state = { companies: {}, order: [], activeId: null };
 let ui = { route: 'overview', bankAcct: null, reportTab: 'pl', range: null, ledgerAcct: null, recon: null, jeDraft: null, docDraft: null, payFor: null, reverseFor: null, confirmDelete: false, jeOpen: null };
 const co = () => state.companies[state.activeId];
 
-/* ----- Storage: private per-person document in the artifact's database; browser storage as a fallback ----- */
+/* ----- Storage -----
+   cloud: Supabase accounts and database, when the build supplies LEDGERLINE_CONFIG (hosted site)
+   db:    private per-person document in the claude.ai Artifact database
+   local: browser storage as a fallback */
+const CONFIG = window.LEDGERLINE_CONFIG || {};
+const pref = { get(k) { try { return localStorage.getItem(k); } catch { return null; } }, set(k, v) { try { localStorage.setItem(k, v); } catch { } } };
 const Store = {
-  mode: 'memory', db: null, ref: null, timer: null, status: 'Example data, not saved yet',
+  mode: CONFIG.supabaseUrl ? 'cloud' : 'memory', db: null, ref: null, timer: null, status: 'Example data, not saved yet',
+  sb: null, user: null, authReady: false, versions: {}, saved: {}, removed: new Set(), queue: Promise.resolve(),
   async init() {
+    if (this.mode === 'cloud') return this.initCloud();
     try {
       const db = await window.claude?.use?.('db');
       const user = await window.claude?.use?.('user');
@@ -32,25 +39,95 @@ const Store = {
       this.setStatus('Saved in this browser only', 'warn');
     } catch { this.mode = 'memory'; this.setStatus('Not saved: storage unavailable here', 'warn'); }
   },
+  async initCloud() {
+    try {
+      if (!window.supabase?.createClient) throw new Error('The sign-in library did not load. Check your connection and reload the page.');
+      this.sb = window.supabase.createClient(CONFIG.supabaseUrl, CONFIG.supabaseAnonKey);
+      const { data } = await this.sb.auth.getSession();
+      this.user = data.session?.user || null;
+      this.sb.auth.onAuthStateChange((event, session) => {
+        const was = this.user?.id; this.user = session?.user || null;
+        if (this.user && this.user.id !== was) this.loadCloud();
+        else if (!this.user && was) { loadSample(); render(); }
+      });
+      if (this.user) await this.loadCloud();
+    } catch (e) { ui.authMsg = { err: true, text: e.message }; }
+    this.authReady = true; render();
+  },
+  async loadCloud() {
+    this.setStatus('Loading your books…', '');
+    const { data, error } = await this.sb.from('companies').select('id, data, version').order('created_at');
+    if (error) { this.setStatus('Could not load your books: ' + error.message, 'warn'); render(); return; }
+    this.versions = {}; this.saved = {}; this.removed.clear();
+    if (data.length) {
+      const companies = {};
+      for (const r of data) { companies[r.id] = r.data; this.versions[r.id] = r.version; this.saved[r.id] = JSON.stringify(r.data); }
+      const last = pref.get('ledgerline-active');
+      state = { companies, order: data.map(r => r.id), activeId: companies[last] ? last : data[0].id };
+      this.setStatus('Saved to your account', 'ok');
+    } else {
+      loadSample();
+      this.setStatus('Example data. Your changes save to your account.', '');
+    }
+    resetView(); render();
+  },
+  forget(id) { if (this.versions[id] != null) this.removed.add(id); },
+  /* Writes only the companies that changed. Each update names the version it was loaded at, so a save made
+     elsewhere in the meantime is never overwritten. */
+  async saveCloud() {
+    for (const id of [...this.removed]) {
+      const { error } = await this.sb.from('companies').delete().eq('id', id);
+      if (error) throw error;
+      this.removed.delete(id); delete this.versions[id]; delete this.saved[id];
+    }
+    for (const id of state.order) {
+      const c = state.companies[id], json = JSON.stringify(c);
+      if (this.saved[id] === json) continue;
+      if (this.versions[id] == null) {
+        const { data, error } = await this.sb.from('companies').insert({ id, name: c.name, data: c }).select('version').single();
+        if (error) throw error;
+        this.versions[id] = data.version;
+      } else {
+        const { data, error } = await this.sb.from('companies').update({ name: c.name, data: c }).eq('id', id).eq('version', this.versions[id]).select('version');
+        if (error) throw error;
+        if (!data.length) throw Object.assign(new Error('stale'), { stale: true });
+        this.versions[id] = data[0].version;
+      }
+      this.saved[id] = json;
+    }
+  },
   save() {
     clearTimeout(this.timer);
     this.setStatus('Saving…', '');
-    this.timer = setTimeout(async () => {
-      await this.ready;
-      const data = JSON.parse(JSON.stringify(state));
-      const size = new Blob([JSON.stringify(data)]).size;
-      if (this.mode === 'db') {
-        if (size > 250000) { this.setStatus('Books are near the prototype storage limit. Download a backup.', 'warn'); }
-        try { await this.ref.set(data); if (size <= 250000) this.setStatus('Saved to your account', 'ok'); }
-        catch (e) { this.setStatus('Could not save: ' + (e.message || e.code || 'error'), 'warn'); }
-      } else if (this.mode === 'local') {
-        try { localStorage.setItem('ledgerline-books', JSON.stringify(data)); this.setStatus('Saved in this browser only', 'warn'); }
-        catch { this.setStatus('Not saved: browser storage is full or blocked', 'warn'); }
-      } else this.setStatus('Not saved: storage unavailable here', 'warn');
-    }, 500);
+    if (state.activeId) pref.set('ledgerline-active', state.activeId);
+    this.timer = setTimeout(() => { this.queue = this.queue.then(() => this.flush()); }, 500);
+  },
+  async flush() {
+    await this.ready;
+    if (this.mode === 'cloud') {
+      if (!this.user) return;
+      try { await this.saveCloud(); this.setStatus('Saved to your account', 'ok'); }
+      catch (e) {
+        if (e.stale) { toast('Your last change was not saved. These books were changed somewhere else, or you have view-only access. Showing the latest saved version.', true); await this.loadCloud(); }
+        else this.setStatus('Could not save: ' + (e.message || 'error') + '. Your changes are still on this screen.', 'warn');
+      }
+      return;
+    }
+    const data = JSON.parse(JSON.stringify(state));
+    const size = new Blob([JSON.stringify(data)]).size;
+    if (this.mode === 'db') {
+      if (size > 250000) { this.setStatus('Books are near the prototype storage limit. Download a backup.', 'warn'); }
+      try { await this.ref.set(data); if (size <= 250000) this.setStatus('Saved to your account', 'ok'); }
+      catch (e) { this.setStatus('Could not save: ' + (e.message || e.code || 'error'), 'warn'); }
+    } else if (this.mode === 'local') {
+      try { localStorage.setItem('ledgerline-books', JSON.stringify(data)); this.setStatus('Saved in this browser only', 'warn'); }
+      catch { this.setStatus('Not saved: browser storage is full or blocked', 'warn'); }
+    } else this.setStatus('Not saved: storage unavailable here', 'warn');
   },
   setStatus(text, kind) { this.status = text; this.kind = kind; const el = $('#savestate'); if (el) el.innerHTML = `<span class="dot ${kind}"></span><span>${esc(text)}</span>`; },
 };
+function loadSample() { const s = buildSampleCompany(); state = { companies: { [s.id]: s }, order: [s.id], activeId: s.id }; }
+function resetView() { Object.assign(ui, { route: 'overview', range: null, recon: null, ledgerAcct: null, docDraft: null, jeDraft: null, payFor: null, reverseFor: null, confirmDelete: false, modal: null }); }
 
 function commit(msg) { Store.save(); render(); if (msg) toast(msg); }
 function attempt(fn, okMsg) { try { fn(); commit(okMsg); } catch (e) { toast(e.message, true); } }
@@ -92,6 +169,7 @@ function presets(c) {
 const NAV = [['overview', 'Overview'], ['bank', 'Bank feed'], ['invoices', 'Invoices'], ['bills', 'Bills'], ['journal', 'Journal'], ['accounts', 'Chart of accounts'], ['reconcile', 'Reconcile'], ['reports', 'Reports'], ['settings', 'Settings'], ['about', 'About this prototype']];
 
 function render() {
+  if (Store.mode === 'cloud' && (!Store.authReady || !Store.user)) { $('#root').innerHTML = authView(); return; }
   const c = co();
   if (!c) { $('#root').innerHTML = shell('<div class="wrap"><div class="panel"><h2>No company yet</h2><p>Create your first company to start keeping books.</p><div><button class="primary" data-act="new-company">Set up a company</button></div></div></div>'); return; }
   E.setCurrency(c.currency, c.country);
@@ -117,6 +195,7 @@ function shell(body) {
     </div>
     <nav aria-label="Sections">${NAV.map(([k, l]) => `<button data-act="go" data-v="${k}" ${ui.route === k ? 'aria-current="page"' : ''}><span>${l}</span>${counts[k] ? `<span class="badge">${counts[k]}</span>` : ''}</button>`).join('')}</nav>
     <div class="savestate" id="savestate"><span class="dot ${Store.kind || ''}"></span><span>${esc(Store.status)}</span></div>
+    ${Store.user ? `<div class="account"><span class="muted small" title="${esc(Store.user.email)}">${esc(Store.user.email)}</span><button class="ghost" data-act="sign-out">Sign out</button></div>` : ''}
   </aside>
   <main><div class="wrap">${c && c.sample ? `<div class="banner"><span><strong>You are looking at example data.</strong> Riverside Coffee Roasters is fictional. Try anything here, then set up your own company.</span><button class="primary" data-act="new-company">Set up my company</button></div>` : ''}${body}</div></main>
   </div>`;
@@ -472,9 +551,56 @@ function wizard() {
   </div></div>`;
 }
 
+/* ----- Sign in (hosted site only) ----- */
+const brandMark = '<svg width="22" height="22" viewBox="0 0 22 22" aria-hidden="true"><rect x="1" y="1" width="20" height="20" rx="4" fill="var(--accent)"/><path d="M6 7h10M6 11h10M6 15h6" stroke="var(--accent-ink)" stroke-width="1.6"/><path d="M11 4v14" stroke="var(--accent-ink)" stroke-width="1.2" opacity=".55"/></svg>';
+function authView() {
+  if (!Store.authReady) return `<div class="authwrap"><div class="authcard"><div class="brand">${brandMark}Ledgerline</div><p class="muted">Loading…</p></div></div>`;
+  const signup = ui.authMode === 'signup', m = ui.authMsg;
+  return `<div class="authwrap"><form class="authcard" id="auth-form" novalidate>
+    <div class="brand">${brandMark}Ledgerline</div>
+    <div><h1>${signup ? 'Create your account' : 'Sign in to your books'}</h1><p class="muted">${signup ? 'Use your work email. You will get an email to confirm it.' : 'Bookkeeping for your business, kept in balance.'}</p></div>
+    <label class="field"><span>Email</span><input type="email" id="auth-email" autocomplete="email" required value="${esc(ui.authEmail || '')}"></label>
+    <label class="field"><span>Password</span><input type="password" id="auth-password" autocomplete="${signup ? 'new-password' : 'current-password'}" minlength="8" required></label>
+    ${m ? `<p class="${m.err ? 'autherr' : 'note'}" role="status">${esc(m.text)}</p>` : ''}
+    <button class="primary" type="submit" ${ui.authBusy ? 'disabled' : ''}>${signup ? 'Create account' : 'Sign in'}</button>
+    <button class="ghost" type="button" data-act="auth-magic" ${ui.authBusy ? 'disabled' : ''}>Email me a sign-in link instead</button>
+    <p class="muted small">${signup ? 'Already have an account?' : 'New to Ledgerline?'} <button class="ghost" type="button" data-act="auth-mode">${signup ? 'Sign in' : 'Create an account'}</button></p>
+  </form></div>`;
+}
+async function authRun(fn) {
+  const email = $('#auth-email').value.trim(), password = $('#auth-password').value;
+  ui.authEmail = email;
+  if (!/^\S+@\S+\.\S+$/.test(email)) { ui.authMsg = { err: true, text: 'Enter a valid email address.' }; return render(); }
+  ui.authBusy = true; ui.authMsg = null; render();
+  try { ui.authMsg = await fn(email, password); }
+  catch (e) { ui.authMsg = { err: true, text: e.message || 'Something went wrong. Try again.' }; }
+  ui.authBusy = false; render();
+}
+document.addEventListener('submit', e => {
+  if (e.target.id !== 'auth-form') return;
+  e.preventDefault();
+  authRun(async (email, password) => {
+    if (password.length < 8) return { err: true, text: 'Passwords are at least 8 characters.' };
+    if (ui.authMode === 'signup') {
+      const { data, error } = await Store.sb.auth.signUp({ email, password, options: { emailRedirectTo: location.origin } });
+      if (error) throw error;
+      return data.session ? null : { text: `We sent a confirmation link to ${email}. Open it to finish creating your account.` };
+    }
+    const { error } = await Store.sb.auth.signInWithPassword({ email, password });
+    if (error) throw new Error(/invalid/i.test(error.message) ? 'That email and password do not match an account.' : error.message);
+    return null;
+  });
+});
+
 /* ----- Downloads ----- */
-const Downloads = { ok: false, ns: null, async init() { try { this.ns = await window.claude?.use?.('downloads'); this.ok = !!this.ns; if (this.ok) render(); } catch { } },
-  async save(filename, data) { try { await this.ns.save({ filename, data }); } catch (e) { if (e?.code !== 'declined') toast('Could not download: ' + (e?.message || e?.code), true); } } };
+const Downloads = {
+  ok: !window.claude, ns: null,
+  async init() { if (!window.claude) return; try { this.ns = await window.claude.use('downloads'); this.ok = !!this.ns; if (this.ok) render(); } catch { } },
+  async save(filename, data) {
+    if (!this.ns) { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([data])); a.download = filename; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); return; }
+    try { await this.ns.save({ filename, data }); } catch (e) { if (e?.code !== 'declined') toast('Could not download: ' + (e?.message || e?.code), true); }
+  },
+};
 const csvOf = rows => rows.map(r => r.map(v => { const s = typeof v === 'number' ? (v / 100).toFixed(2) : String(v ?? ''); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; }).join(',')).join('\n');
 
 /* ----- Events ----- */
@@ -485,6 +611,9 @@ document.addEventListener('click', e => {
   const c = co(); const v = el.dataset.v;
   const [k2, id2] = (v || '').split(':');
   switch (el.dataset.act) {
+    case 'auth-mode': ui.authMode = ui.authMode === 'signup' ? 'signin' : 'signup'; ui.authMsg = null; render(); break;
+    case 'auth-magic': authRun(async email => { const { error } = await Store.sb.auth.signInWithOtp({ email, options: { emailRedirectTo: location.origin } }); if (error) throw error; return { text: `We sent a sign-in link to ${email}.` }; }); break;
+    case 'sign-out': Store.queue.then(() => Store.sb.auth.signOut()); break;
     case 'go': ui.route = v; ui.modal = null; render(); window.scrollTo(0, 0); break;
     case 'report': ui.route = 'reports'; ui.reportTab = v; render(); break;
     case 'new-company': openWizard(); break;
@@ -552,7 +681,7 @@ document.addEventListener('click', e => {
     case 'delete-ask': ui.confirmDelete = true; render(); break;
     case 'delete-no': ui.confirmDelete = false; render(); break;
     case 'delete-yes': {
-      const name = c.name; delete state.companies[c.id]; state.order = state.order.filter(x => x !== c.id); state.activeId = state.order[0] || null; ui.confirmDelete = false; ui.route = 'overview'; ui.range = null; ui.recon = null;
+      const name = c.name; Store.forget(c.id); delete state.companies[c.id]; state.order = state.order.filter(x => x !== c.id); state.activeId = state.order[0] || null; ui.confirmDelete = false; ui.route = 'overview'; ui.range = null; ui.recon = null;
       commit(`${name} deleted.`); if (!state.activeId) openWizard(); break;
     }
   }
@@ -593,7 +722,7 @@ document.addEventListener('change', async e => {
     const k = t.dataset.set;
     if (k === 'taxRate') { const bps = Math.round(parseFloat(t.value || '0') * 100); if (isNaN(bps) || bps < 0 || bps > 5000) return toast('Enter a rate between 0 and 50.', true); E.log(c, 'Tax rate changed', `${(c.taxRateBps / 100).toFixed(2)}% to ${(bps / 100).toFixed(2)}%`); c.taxRateBps = bps; }
     else if (k === 'fiscalStartMonth') { c.fiscalStartMonth = +t.value; ui.range = null; E.log(c, 'Fiscal year changed', `Starts in ${MONTHS[c.fiscalStartMonth - 1]}`); }
-    else { E.log(c, 'Company profile updated', `${k}: ${c[k] || '(blank)'} to ${t.value}`); c[k] = t.value; }
+    else { const label = { name: 'Name', taxId: J(c).taxId, entityType: 'Entity type', region: 'Region' }[k] || k; E.log(c, 'Company profile updated', `${label}: ${c[k] || '(blank)'} to ${t.value || '(blank)'}`); c[k] = t.value; }
     if (k === 'name') c.sample = false;
     commit('Saved.'); return;
   }
@@ -607,8 +736,7 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape' && ui.modal &
 
 /* ----- Boot ----- */
 (function boot() {
-  const s = buildSampleCompany();
-  state = { companies: { [s.id]: s }, order: [s.id], activeId: s.id };
+  loadSample();
   render();
   Store.ready = Store.init(); Downloads.init();
 })();
